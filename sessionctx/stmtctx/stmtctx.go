@@ -118,6 +118,9 @@ type StatementContext struct {
 	// InsertID is the given insert ID of an auto_increment column.
 	InsertID uint64
 
+	BaseRowID int64
+	MaxRowID  int64
+
 	// Copied from SessionVars.TimeZone.
 	TimeZone         *time.Location
 	Priority         mysql.PriorityEnum
@@ -135,7 +138,8 @@ type StatementContext struct {
 		normalized string
 		digest     string
 	}
-	Tables []TableEntry
+	Tables    []TableEntry
+	PointExec bool // for point update cached execution, Constant expression need to set "paramMarker"
 }
 
 // StmtHints are SessionVars related sql hints.
@@ -427,6 +431,8 @@ func (sc *StatementContext) ResetForRetry() {
 	sc.mu.execDetails = execdetails.ExecDetails{}
 	sc.mu.allExecDetails = make([]*execdetails.ExecDetails, 0, 4)
 	sc.mu.Unlock()
+	sc.MaxRowID = 0
+	sc.BaseRowID = 0
 	sc.TableIDs = sc.TableIDs[:0]
 	sc.IndexNames = sc.IndexNames[:0]
 }

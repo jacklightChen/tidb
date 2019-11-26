@@ -388,6 +388,10 @@ func (t *tableCommon) rebuildIndices(ctx sessionctx.Context, rm kv.RetrieverMuta
 			untouched = false
 			break
 		}
+		// If txn is auto commit and index is untouched, no need to write index value.
+		if untouched && !ctx.GetSessionVars().InTxn() {
+			continue
+		}
 		newVs, err := idx.FetchValues(newData, nil)
 		if err != nil {
 			return err
@@ -413,10 +417,6 @@ func adjustRowValuesBuf(writeBufs *variable.WriteStmtBufs, rowLen int) {
 // getRollbackableMemStore get a rollbackable BufferStore, when we are importing data,
 // Just add the kv to transaction's membuf directly.
 func (t *tableCommon) getRollbackableMemStore(ctx sessionctx.Context) (kv.RetrieverMutator, error) {
-	if ctx.GetSessionVars().LightningMode {
-		return ctx.Txn(true)
-	}
-
 	bs := ctx.GetSessionVars().GetWriteStmtBufs().BufStore
 	if bs == nil {
 		txn, err := ctx.Txn(true)
@@ -455,9 +455,22 @@ func (t *tableCommon) AddRecord(ctx sessionctx.Context, r []types.Datum, opts ..
 		}
 	}
 	if !hasRecordID {
-		recordID, err = t.AllocHandle(ctx)
-		if err != nil {
-			return 0, err
+		stmtCtx := ctx.GetSessionVars().StmtCtx
+		rows := stmtCtx.RecordRows()
+		if rows > 1 {
+			if stmtCtx.BaseRowID >= stmtCtx.MaxRowID {
+				stmtCtx.BaseRowID, stmtCtx.MaxRowID, err = t.AllocHandleIDs(ctx, rows)
+				if err != nil {
+					return 0, err
+				}
+			}
+			stmtCtx.BaseRowID += 1
+			recordID = stmtCtx.BaseRowID
+		} else {
+			recordID, err = t.AllocHandle(ctx)
+			if err != nil {
+				return 0, err
+			}
 		}
 	}
 
@@ -528,12 +541,10 @@ func (t *tableCommon) AddRecord(ctx sessionctx.Context, r []types.Datum, opts ..
 	}
 	txn.SetAssertion(key, kv.None)
 
-	if !sessVars.LightningMode {
-		if err = rm.(*kv.BufferStore).SaveTo(txn); err != nil {
-			return 0, err
-		}
-		ctx.StmtAddDirtyTableOP(table.DirtyTableAddRow, t.physicalTableID, recordID)
+	if err = rm.(*kv.BufferStore).SaveTo(txn); err != nil {
+		return 0, err
 	}
+	ctx.StmtAddDirtyTableOP(table.DirtyTableAddRow, t.physicalTableID, recordID)
 
 	if shouldWriteBinlog(ctx) {
 		// For insert, TiDB and Binlog can use same row and schema.
@@ -594,7 +605,7 @@ func (t *tableCommon) addIndices(sctx sessionctx.Context, recordID int64, r []ty
 	} else {
 		ctx = context.Background()
 	}
-	skipCheck := sctx.GetSessionVars().LightningMode || sctx.GetSessionVars().StmtCtx.BatchCheck
+	skipCheck := sctx.GetSessionVars().StmtCtx.BatchCheck
 	if t.meta.PKIsHandle && !skipCheck && !opt.SkipHandleCheck {
 		if err := CheckHandleExists(ctx, sctx, t, recordID, nil); err != nil {
 			return recordID, err
@@ -845,7 +856,7 @@ func (t *tableCommon) buildIndexForRow(ctx sessionctx.Context, rm kv.RetrieverMu
 				return err
 			}
 
-			return kv.ErrKeyExists.FastGen("Duplicate entry '%s' for key '%s'", entryKey, idx.Meta().Name)
+			return kv.ErrKeyExists.FastGenByArgs(entryKey, idx.Meta().Name)
 		}
 		return err
 	}
@@ -949,13 +960,19 @@ func GetColDefaultValue(ctx sessionctx.Context, col *table.Column, defaultVals [
 
 // AllocHandle implements table.Table AllocHandle interface.
 func (t *tableCommon) AllocHandle(ctx sessionctx.Context) (int64, error) {
-	rowID, err := t.Allocator(ctx).Alloc(t.tableID)
+	_, rowID, err := t.AllocHandleIDs(ctx, 1)
+	return rowID, err
+}
+
+// AllocHandle implements table.Table AllocHandle interface.
+func (t *tableCommon) AllocHandleIDs(ctx sessionctx.Context, n uint64) (int64, int64, error) {
+	base, maxID, err := t.Allocator(ctx).Alloc(t.tableID, n)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if t.meta.ShardRowIDBits > 0 {
 		// Use max record ShardRowIDBits to check overflow.
-		if OverflowShardBits(rowID, t.meta.MaxShardRowIDBits) {
+		if OverflowShardBits(maxID, t.meta.MaxShardRowIDBits) {
 			// If overflow, the rowID may be duplicated. For examples,
 			// t.meta.ShardRowIDBits = 4
 			// rowID = 0010111111111111111111111111111111111111111111111111111111111111
@@ -963,16 +980,17 @@ func (t *tableCommon) AllocHandle(ctx sessionctx.Context) (int64, error) {
 			// will be duplicated with:
 			// rowID = 0100111111111111111111111111111111111111111111111111111111111111
 			// shard = 0010000000000000000000000000000000000000000000000000000000000000
-			return 0, autoid.ErrAutoincReadFailed
+			return 0, 0, autoid.ErrAutoincReadFailed
 		}
 		txnCtx := ctx.GetSessionVars().TxnCtx
 		if txnCtx.Shard == nil {
 			shard := t.calcShard(txnCtx.StartTS)
 			txnCtx.Shard = &shard
 		}
-		rowID |= *txnCtx.Shard
+		base |= *txnCtx.Shard
+		maxID |= *txnCtx.Shard
 	}
-	return rowID, nil
+	return base, maxID, nil
 }
 
 // OverflowShardBits checks whether the rowID overflow `1<<(64-shardRowIDBits-1) -1`.
@@ -1070,10 +1088,6 @@ func (t *tableCommon) canSkipUpdateBinlog(col *table.Column, value types.Datum) 
 	}
 	return false
 }
-
-var (
-	recordPrefixSep = []byte("_r")
-)
 
 // FindIndexByColName returns a public table index containing only one column named `name`.
 func FindIndexByColName(t table.Table, name string) table.Index {

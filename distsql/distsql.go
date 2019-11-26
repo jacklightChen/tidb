@@ -24,11 +24,7 @@ import (
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
-)
-
-// XAPI error codes.
-const (
-	codeInvalidResp = 1
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 // Select sends a DAG request, returns SelectResult.
@@ -74,17 +70,20 @@ func Select(ctx context.Context, sctx sessionctx.Context, kvReq *kv.Request, fie
 			feedback:   fb,
 		}, nil
 	}
+	encodetype := tipb.EncodeType_TypeDefault
+	if canUseChunkRPC(sctx) {
+		encodetype = tipb.EncodeType_TypeChunk
+	}
 	return &selectResult{
 		label:      "dag",
 		resp:       resp,
-		results:    make(chan resultWithErr, kvReq.Concurrency),
-		closed:     make(chan struct{}),
 		rowLen:     len(fieldTypes),
 		fieldTypes: fieldTypes,
 		ctx:        sctx,
 		feedback:   fb,
 		sqlType:    label,
 		memTracker: kvReq.MemTracker,
+		encodeType: encodetype,
 	}, nil
 }
 
@@ -115,12 +114,11 @@ func Analyze(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv.
 		label = metrics.LblInternal
 	}
 	result := &selectResult{
-		label:    "analyze",
-		resp:     resp,
-		results:  make(chan resultWithErr, kvReq.Concurrency),
-		closed:   make(chan struct{}),
-		feedback: statistics.NewQueryFeedback(0, nil, 0, false),
-		sqlType:  label,
+		label:      "analyze",
+		resp:       resp,
+		feedback:   statistics.NewQueryFeedback(0, nil, 0, false),
+		sqlType:    label,
+		encodeType: tipb.EncodeType_TypeDefault,
 	}
 	return result, nil
 }
@@ -132,12 +130,33 @@ func Checksum(ctx context.Context, client kv.Client, kvReq *kv.Request, vars *kv
 		return nil, errors.New("client returns nil response")
 	}
 	result := &selectResult{
-		label:    "checksum",
-		resp:     resp,
-		results:  make(chan resultWithErr, kvReq.Concurrency),
-		closed:   make(chan struct{}),
-		feedback: statistics.NewQueryFeedback(0, nil, 0, false),
-		sqlType:  metrics.LblGeneral,
+		label:      "checksum",
+		resp:       resp,
+		feedback:   statistics.NewQueryFeedback(0, nil, 0, false),
+		sqlType:    metrics.LblGeneral,
+		encodeType: tipb.EncodeType_TypeDefault,
 	}
 	return result, nil
+}
+
+// SetEncodeType sets the encoding method for the DAGRequest. The supported encoding
+// methods are:
+// 1. TypeChunk: the result is encoded using the Chunk format, refer util/chunk/chunk.go
+// 2. TypeDefault: the result is encoded row by row
+func SetEncodeType(ctx sessionctx.Context, dagReq *tipb.DAGRequest) {
+	if canUseChunkRPC(ctx) {
+		dagReq.EncodeType = tipb.EncodeType_TypeChunk
+	} else {
+		dagReq.EncodeType = tipb.EncodeType_TypeDefault
+	}
+}
+
+func canUseChunkRPC(ctx sessionctx.Context) bool {
+	if !ctx.GetSessionVars().EnableChunkRPC {
+		return false
+	}
+	if ctx.GetSessionVars().EnableStreaming {
+		return false
+	}
+	return true
 }

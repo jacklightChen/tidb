@@ -84,6 +84,21 @@ func (s *testMemoSuite) TestGroupDelete(c *C) {
 	c.Assert(g.Equivalents.Len(), Equals, 0)
 }
 
+func (s *testMemoSuite) TestGroupDeleteAll(c *C) {
+	expr := NewGroupExpr(plannercore.LogicalSelection{}.Init(s.sctx, 0))
+	g := NewGroupWithSchema(expr, nil)
+	c.Assert(g.Insert(NewGroupExpr(plannercore.LogicalLimit{}.Init(s.sctx, 0))), IsTrue)
+	c.Assert(g.Insert(NewGroupExpr(plannercore.LogicalProjection{}.Init(s.sctx, 0))), IsTrue)
+	c.Assert(g.Equivalents.Len(), Equals, 3)
+	c.Assert(g.GetFirstElem(OperandProjection), NotNil)
+	c.Assert(g.Exists(expr), IsTrue)
+
+	g.DeleteAll()
+	c.Assert(g.Equivalents.Len(), Equals, 0)
+	c.Assert(g.GetFirstElem(OperandProjection), IsNil)
+	c.Assert(g.Exists(expr), IsFalse)
+}
+
 func (s *testMemoSuite) TestGroupExists(c *C) {
 	p := &plannercore.LogicalLimit{}
 	expr := NewGroupExpr(p)
@@ -117,11 +132,12 @@ type fakeImpl struct {
 	plan plannercore.PhysicalPlan
 }
 
-func (impl *fakeImpl) CalcCost(float64, []float64, ...*Group) float64 { return 0 }
-func (impl *fakeImpl) SetCost(float64)                                {}
-func (impl *fakeImpl) GetCost() float64                               { return 0 }
-func (impl *fakeImpl) GetPlan() plannercore.PhysicalPlan              { return impl.plan }
-
+func (impl *fakeImpl) CalcCost(float64, ...Implementation) float64     { return 0 }
+func (impl *fakeImpl) SetCost(float64)                                 {}
+func (impl *fakeImpl) GetCost() float64                                { return 0 }
+func (impl *fakeImpl) GetPlan() plannercore.PhysicalPlan               { return impl.plan }
+func (impl *fakeImpl) AttachChildren(...Implementation) Implementation { return nil }
+func (impl *fakeImpl) ScaleCostLimit(float64) float64                  { return 0 }
 func (s *testMemoSuite) TestGetInsertGroupImpl(c *C) {
 	g := NewGroupWithSchema(NewGroupExpr(plannercore.LogicalLimit{}.Init(s.sctx, 0)), nil)
 	emptyProp := &property.PhysicalProperty{}
@@ -138,4 +154,40 @@ func (s *testMemoSuite) TestGetInsertGroupImpl(c *C) {
 
 	newImpl = g.GetImpl(orderProp)
 	c.Assert(newImpl, IsNil)
+}
+
+func (s *testMemoSuite) TestEngineTypeSet(c *C) {
+	c.Assert(EngineAll.Contains(EngineTiDB), IsTrue)
+	c.Assert(EngineAll.Contains(EngineTiKV), IsTrue)
+	c.Assert(EngineAll.Contains(EngineTiFlash), IsTrue)
+
+	c.Assert(EngineTiDBOnly.Contains(EngineTiDB), IsTrue)
+	c.Assert(EngineTiDBOnly.Contains(EngineTiKV), IsFalse)
+	c.Assert(EngineTiDBOnly.Contains(EngineTiFlash), IsFalse)
+
+	c.Assert(EngineTiKVOnly.Contains(EngineTiDB), IsFalse)
+	c.Assert(EngineTiKVOnly.Contains(EngineTiKV), IsTrue)
+	c.Assert(EngineTiKVOnly.Contains(EngineTiFlash), IsFalse)
+
+	c.Assert(EngineTiFlashOnly.Contains(EngineTiDB), IsFalse)
+	c.Assert(EngineTiFlashOnly.Contains(EngineTiKV), IsFalse)
+	c.Assert(EngineTiFlashOnly.Contains(EngineTiFlash), IsTrue)
+
+	c.Assert(EngineTiKVOrTiFlash.Contains(EngineTiDB), IsFalse)
+	c.Assert(EngineTiKVOrTiFlash.Contains(EngineTiKV), IsTrue)
+	c.Assert(EngineTiKVOrTiFlash.Contains(EngineTiFlash), IsTrue)
+}
+
+func (s *testMemoSuite) TestFirstElemAfterDelete(c *C) {
+	oldExpr := NewGroupExpr(plannercore.LogicalLimit{}.Init(s.sctx, 0))
+	g := NewGroupWithSchema(oldExpr, nil)
+	newExpr := NewGroupExpr(plannercore.LogicalLimit{}.Init(s.sctx, 0))
+	g.Insert(newExpr)
+	c.Assert(g.GetFirstElem(OperandLimit), NotNil)
+	c.Assert(g.GetFirstElem(OperandLimit).Value, Equals, oldExpr)
+	g.Delete(oldExpr)
+	c.Assert(g.GetFirstElem(OperandLimit), NotNil)
+	c.Assert(g.GetFirstElem(OperandLimit).Value, Equals, newExpr)
+	g.Delete(newExpr)
+	c.Assert(g.GetFirstElem(OperandLimit), IsNil)
 }

@@ -168,6 +168,9 @@ type Table interface {
 	// AllocHandle allocates a handle for a new row.
 	AllocHandle(ctx sessionctx.Context) (int64, error)
 
+	// AllocHandleIds allocates multiple handle for rows.
+	AllocHandleIDs(ctx sessionctx.Context, n uint64) (int64, int64, error)
+
 	// Allocator returns Allocator.
 	Allocator(ctx sessionctx.Context) autoid.Allocator
 
@@ -192,7 +195,20 @@ func AllocAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.Conte
 		span1 := span.Tracer().StartSpan("table.AllocAutoIncrementValue", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
 	}
-	return t.Allocator(sctx).Alloc(t.Meta().ID)
+	_, max, err := t.Allocator(sctx).Alloc(t.Meta().ID, uint64(1))
+	if err != nil {
+		return 0, err
+	}
+	return max, err
+}
+
+// AllocBatchAutoIncrementValue allocates batch auto_increment value (min and max] for rows.
+func AllocBatchAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.Context, N int) (int64, int64, error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("table.AllocBatchAutoIncrementValue", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+	}
+	return t.Allocator(sctx).Alloc(t.Meta().ID, uint64(N))
 }
 
 // PhysicalTable is an abstraction for two kinds of table representation: partition or non-partitioned table.
